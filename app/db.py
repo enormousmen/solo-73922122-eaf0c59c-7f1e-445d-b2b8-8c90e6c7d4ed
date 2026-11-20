@@ -18,6 +18,24 @@ passed is swept to ``released_at = <now>, release_reason = 'expired'`` at
 the start of each write transaction.  That keeps the partial unique indexes
 ("one active lease per address", "one active lease per client") truthful
 without needing a clock-dependent index predicate.
+
+Address history
+---------------
+``lease_history`` records one row per *interval* during which a lease held
+an address.  A renewal closes the current interval at the renewal instant
+and opens a new one (the new term only counts from that instant); a release
+closes the interval at the release instant.  An interval whose agreed
+``expires_at`` has passed is over at that instant by definition — natural
+expiry needs no sweeper to take effect — and the sweeper merely marks such
+open intervals with ``end_reason = 'expired'`` for completeness.
+
+History rows are written in the same transaction as the lease change they
+describe, so a failure leaves neither a lease mutation nor a history row
+behind.  A database created by an older version is retrofitted on startup:
+the upgrade instant is stored as ``history_started_at`` and every lease that
+is still valid then gets one backfilled interval starting at that instant.
+Nothing before the horizon can be confirmed, so history reports mark it
+``unknown`` rather than guessing.
 """
 
 from __future__ import annotations
@@ -70,6 +88,28 @@ CREATE TABLE IF NOT EXISTS pool_changes (
     new_cidr       TEXT NOT NULL,
     changed_at     REAL NOT NULL
 );
+
+-- One row per interval during which a lease held its address.  Renewals
+-- split an interval at the renewal instant; releases and natural expiry
+-- close it.  Rows are inserted in the same transaction as the lease change.
+CREATE TABLE IF NOT EXISTS lease_history (
+    history_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_id     TEXT NOT NULL,
+    client_id    TEXT NOT NULL,
+    ip           TEXT NOT NULL,
+    started_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL,
+    ended_at     REAL,
+    end_reason   TEXT,
+    CHECK (ended_at IS NULL OR ended_at >= started_at),
+    CHECK (expires_at > started_at),
+    CHECK (end_reason IS NULL OR end_reason IN ('renewed', 'released', 'expired'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_history_ip_time
+    ON lease_history(ip, started_at);
+CREATE INDEX IF NOT EXISTS ix_history_lease
+    ON lease_history(lease_id);
 """
 
 
@@ -171,21 +211,59 @@ class Store:
 
         A restart restores whatever pool was last committed; the environment
         default only seeds a fresh database.
+
+        A database written by a version without history support is upgraded
+        in place: the upgrade instant becomes ``history_started_at`` and
+        every lease still valid then is backfilled with one interval starting
+        at that instant.  The horizon is written once and survives restarts.
         """
         conn = self._connect()
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key = 'current_pool'"
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO settings(key, value) VALUES ('current_pool', ?)",
-                    (str(self._pool),),
-                )
-            else:
-                self._pool = subnets.parse_pool_cidr(row["value"])
+            # One write transaction so an interrupted upgrade leaves neither a
+            # horizon nor partial backfill rows behind.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'current_pool'"
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES ('current_pool', ?)",
+                        (str(self._pool),),
+                    )
+                else:
+                    self._pool = subnets.parse_pool_cidr(row["value"])
+
+                horizon = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'history_started_at'"
+                ).fetchone()
+                if horizon is None:
+                    started_at = self.clock()
+                    conn.execute(
+                        "INSERT INTO settings(key, value) "
+                        "VALUES ('history_started_at', ?)",
+                        (str(started_at),),
+                    )
+                    # Only leases still valid at the upgrade instant can be
+                    # adopted; expired rows from the old version stay auditable
+                    # in ``leases`` but have no history.
+                    conn.execute(
+                        """
+                        INSERT INTO lease_history(lease_id, client_id, ip,
+                                                  started_at, expires_at)
+                        SELECT lease_id, client_id, ip, ?, expires_at
+                          FROM leases
+                         WHERE released_at IS NULL
+                           AND expires_at > ?
+                        """,
+                        (started_at, started_at),
+                    )
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
         finally:
             conn.close()
 
@@ -243,7 +321,57 @@ class Store:
             """,
             (now, now),
         )
-        return cur.rowcount
+        swept = cur.rowcount
+        # Close the matching open history intervals.  Natural expiry already
+        # ended them at expires_at; this only records the fact for reports.
+        if swept:
+            conn.execute(
+                """
+                UPDATE lease_history
+                   SET ended_at = expires_at, end_reason = 'expired'
+                 WHERE ended_at IS NULL
+                   AND expires_at <= ?
+                """,
+                (now,),
+            )
+        return swept
+
+    @staticmethod
+    def _open_history_interval(
+        conn: sqlite3.Connection,
+        lease_id: str,
+        client_id: str,
+        ip: str,
+        started_at: float,
+        expires_at: float,
+    ) -> None:
+        """Open a fresh held-interval row for a newly issued or renewed lease."""
+        conn.execute(
+            """
+            INSERT INTO lease_history(lease_id, client_id, ip,
+                                      started_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (lease_id, client_id, ip, started_at, expires_at),
+        )
+
+    @staticmethod
+    def _close_history_interval(
+        conn: sqlite3.Connection,
+        lease_id: str,
+        ended_at: float,
+        reason: str,
+    ) -> None:
+        """Close the lease's still-open interval (renewal or explicit release)."""
+        conn.execute(
+            """
+            UPDATE lease_history
+               SET ended_at = ?, end_reason = ?
+             WHERE lease_id = ?
+               AND ended_at IS NULL
+            """,
+            (ended_at, reason, lease_id),
+        )
 
     def _active_rows(self, conn: sqlite3.Connection, now: float) -> list[sqlite3.Row]:
         return conn.execute(
@@ -344,6 +472,147 @@ class Store:
         result.sort(key=lambda item: (item["expires_at"], item["ip"]))
         return result
 
+    def address_history(
+        self, ip_text: str, window_start: float, window_end: float
+    ) -> dict[str, Any]:
+        """Reconstruct who held ``ip_text`` throughout a UTC time window.
+
+        The window is half-open: ``[window_start, window_end)``.  Each returned
+        segment covers exactly one state over its own half-open interval:
+
+        * ``held``    — a lease held the address; the agreed ``expires_at`` is
+                        the deadline in force at that time, which a renewal may
+                        have replaced before it was reached;
+        * ``unheld``  — the address was inside the traceable horizon but no
+                        lease held it then (released or naturally expired);
+        * ``unknown`` — the time predates ``history_started_at`` (the upgrade
+                        instant for a pre-existing database), so no record exists.
+
+        ``unique_owner`` is only populated when every segment of the window is
+        ``held`` by the same client.  Whether the window must lie in the past is
+        an API-layer policy; the store itself answers for any ordered window.
+        """
+        try:
+            address = ipaddress.IPv4Address(ip_text)
+        except ValueError as exc:
+            raise LeaseError(
+                422, "invalid_address", f"{ip_text!r} is not a valid IPv4 address"
+            ) from exc
+        if not window_start < window_end:
+            raise LeaseError(
+                422,
+                "invalid_window",
+                "start must be strictly earlier than end (half-open [start, end))",
+            )
+        now = self.clock()
+        with self._read() as conn:
+            horizon_row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'history_started_at'"
+            ).fetchone()
+            horizon = float(horizon_row["value"]) if horizon_row is not None else now
+            rows = conn.execute(
+                """
+                SELECT lease_id, client_id, started_at, expires_at, ended_at
+                  FROM lease_history
+                 WHERE ip = ?
+                   AND started_at < ?
+                 ORDER BY started_at, history_id
+                """,
+                (str(address), window_end),
+            ).fetchall()
+
+        segments: list[dict[str, Any]] = []
+        cursor = window_start
+        index = 0
+        while cursor < window_end:
+            if cursor < horizon:
+                boundary = min(window_end, horizon)
+                segments.append(
+                    {
+                        "state": "unknown",
+                        "from": iso(cursor),
+                        "to": iso(boundary),
+                        "client_id": None,
+                        "lease_id": None,
+                        "expires_at": None,
+                    }
+                )
+                cursor = boundary
+                continue
+
+            # Skip intervals that ended before the cursor (cannot overlap).
+            while index < len(rows):
+                row = rows[index]
+                if (row["ended_at"] if row["ended_at"] is not None else row["expires_at"]) > cursor:
+                    break
+                index += 1
+
+            if index >= len(rows):
+                boundary = window_end
+            else:
+                row = rows[index]
+                if row["started_at"] > cursor:
+                    # Traceable time with no covering interval: nobody held it.
+                    boundary = min(window_end, row["started_at"])
+                    segments.append(
+                        {
+                            "state": "unheld",
+                            "from": iso(cursor),
+                            "to": iso(boundary),
+                            "client_id": None,
+                            "lease_id": None,
+                            "expires_at": None,
+                        }
+                    )
+                    cursor = boundary
+                    continue
+                effective_end = (
+                    row["ended_at"] if row["ended_at"] is not None else row["expires_at"]
+                )
+                boundary = min(window_end, effective_end)
+                segments.append(
+                    {
+                        "state": "held",
+                        "from": iso(cursor),
+                        "to": iso(boundary),
+                        "client_id": row["client_id"],
+                        "lease_id": row["lease_id"],
+                        "expires_at": iso(row["expires_at"]),
+                    }
+                )
+                index += 1
+                cursor = boundary
+                continue
+            segments.append(
+                {
+                    "state": "unheld",
+                    "from": iso(cursor),
+                    "to": iso(boundary),
+                    "client_id": None,
+                    "lease_id": None,
+                    "expires_at": None,
+                }
+            )
+            cursor = boundary
+
+        holders = {
+            segment["client_id"]
+            for segment in segments
+            if segment["state"] == "held"
+        }
+        unique_owner = next(iter(holders)) if len(holders) == 1 and len(
+            [s for s in segments if s["state"] != "held"]
+        ) == 0 else None
+        return {
+            "ip": str(address),
+            "window_start": iso(window_start),
+            "window_end": iso(window_end),
+            "history_started_at": iso(horizon),
+            "server_time": iso(now),
+            "unique_owner": unique_owner,
+            "segments": segments,
+        }
+
     # --------------------------------------------------------------- commands
 
     def acquire(
@@ -394,6 +663,16 @@ class Store:
                     now + ttl,
                 ),
             )
+            # The first held interval starts with the lease; same transaction,
+            # so a later failure rolls the history row back with the lease.
+            self._open_history_interval(
+                conn,
+                lease_id,
+                client_id,
+                str(ipaddress.IPv4Address(address)),
+                now,
+                now + ttl,
+            )
             row = conn.execute(
                 "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
             ).fetchone()
@@ -422,9 +701,15 @@ class Store:
                     f"{lease.ip} is outside the current pool {pool}; "
                     "it may be released but not renewed",
                 )
+            # The old term only counts up to the renewal instant; the new term
+            # starts there with its own agreed deadline.
+            self._close_history_interval(conn, lease_id, now, "renewed")
             conn.execute(
                 "UPDATE leases SET expires_at = ? WHERE lease_id = ?",
                 (now + ttl, lease_id),
+            )
+            self._open_history_interval(
+                conn, lease_id, lease.client_id, lease.ip, now, now + ttl
             )
             row = conn.execute(
                 "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
@@ -450,6 +735,7 @@ class Store:
                     """,
                     (now, lease_id),
                 )
+                self._close_history_interval(conn, lease_id, now, "released")
                 row = conn.execute(
                     "SELECT * FROM leases WHERE lease_id = ?", (lease_id,)
                 ).fetchone()

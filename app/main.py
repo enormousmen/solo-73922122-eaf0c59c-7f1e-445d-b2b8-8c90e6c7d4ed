@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Request, Response, status
@@ -27,6 +28,9 @@ Single-subnet IPv4 DHCP-style lease API.
   previous pool keeps serving.  The pool and all leases survive restarts.
 * **Operators** (`GET /v1/admin/out-of-pool`) can list still-occupied
   addresses that lie outside the current pool, with their expiry times.
+* **Forensics** (`GET /v1/admin/addresses/{ip}/history`) reconstructs who held
+  an address over a past UTC window `[start, end)`, segment by segment,
+  distinguishing held, unheld and pre-traceability (`unknown`) time.
 """
 
 
@@ -79,7 +83,7 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
 
     app = FastAPI(
         title="Branch Gateway Lease API",
-        version="1.0.0",
+        version="1.1.0",
         description=DESCRIPTION,
         lifespan=lifespan,
     )
@@ -202,6 +206,42 @@ def create_app(settings: Settings | None = None, store: Store | None = None) -> 
     ) -> dict[str, Any]:
         leases = store.out_of_pool_leases()
         return {"count": len(leases), "leases": leases}
+
+    @app.get(
+        "/v1/admin/addresses/{ip}/history",
+        tags=["admin"],
+        summary="Reconstruct who held an IPv4 address over a past UTC window (operator)",
+    )
+    def address_history(
+        ip: str,
+        start: datetime,
+        end: datetime,
+        store: Store = Depends(get_store),
+        _: None = Depends(require_operator),
+    ) -> dict[str, Any]:
+        # The window is given in UTC; require explicit offsets so no silent
+        # timezone assumption can shift the forensics window.
+        if start.tzinfo is None or end.tzinfo is None:
+            raise LeaseError(
+                422,
+                "invalid_window",
+                "start and end must be timezone-aware UTC timestamps, e.g. 2026-11-20T08:00:00Z",
+            )
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        if not start < end:
+            raise LeaseError(
+                422,
+                "invalid_window",
+                "start must be strictly earlier than end (half-open [start, end))",
+            )
+        if end.timestamp() > store.clock():
+            raise LeaseError(
+                422,
+                "window_not_past",
+                "end must not be later than the current server time",
+            )
+        return store.address_history(ip, start.timestamp(), end.timestamp())
 
     return app
 

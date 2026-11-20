@@ -44,11 +44,12 @@ Configuration (env vars, see `docker-compose.yml`):
 | `POST` | `/v1/leases/{lease_id}/renew` | Renew an active in-pool lease |
 | `POST` | `/v1/leases/{lease_id}/release` | Release an active lease |
 | `GET` | `/v1/admin/out-of-pool` | Still-occupied addresses outside the pool (operator) |
+| `GET` | `/v1/admin/addresses/{ip}/history` | Who held an IPv4 address over a past UTC window (operator) |
 
 Errors are structured: `{"error": {"code": "...", "message": "..."}}` with
 codes such as `pool_exhausted`, `lease_not_found`, `lease_released`,
 `lease_expired`, `address_out_of_pool`, `invalid_pool`, `invalid_ttl`,
-`unauthorized`.
+`invalid_address`, `invalid_window`, `window_not_past`, `unauthorized`.
 
 ## Semantics
 
@@ -75,6 +76,33 @@ each write transaction and are reported as `expired` once past their
 deadline even before a sweep. Expired rows stay in the table for auditing
 and `GET /v1/leases/{id}`.
 
+**Address history (forensics)**: `GET /v1/admin/addresses/{ip}/history`
+takes a half-open past UTC window via `start` and `end` query parameters
+(RFC 3339, offsets required, e.g. `2026-11-20T08:00:00Z`; `end` must not be
+later than server time) and returns the window tiled into segments:
+
+- `held` — a lease held the address, with `client_id`, `lease_id` and the
+  `expires_at` agreed at that time;
+- `unheld` — traceable time during which no lease held the address (after a
+  release or a natural expiry);
+- `unknown` — time before the traceability horizon, for which no record
+  exists.
+
+A renewal splits the held interval at the renewal instant: the old term
+counts only up to that instant and the new term starts there, each segment
+carrying its own agreed `expires_at`. Natural expiry ends a held segment at
+the deadline itself, without waiting for the sweeper. `unique_owner` is a
+client id only when **every** segment of the window is `held` by that same
+client; any `unheld`/`unknown` time or a second holder yields `null`.
+
+**Upgrading an existing database**: on first startup with the new schema
+the upgrade instant is stored as `history_started_at` (the horizon) and
+every lease still valid then is backfilled with one history interval
+starting at that instant. Earlier time is reported as `unknown`, never
+guessed. The horizon and all history rows persist across restarts. History
+writes share the lease transaction, so a failed acquire, renewal or release
+leaves no history trace behind.
+
 **Restart**: the pool is stored in the database's `settings` table; the
 environment default only seeds a fresh file. Relaunching the container
 restores the pool, all leases and the switch history (`pool_changes`).
@@ -97,5 +125,9 @@ python3 -m pytest -q
 - `tests/test_subnets.py` — CIDR parsing, usable ranges, lowest-free search
 - `tests/test_store.py` — allocation, idempotency, renew/release rules, expiry,
   pool moves, restart recovery
+- `tests/test_history.py` — held/unheld/unknown window reconstruction across
+  renewals, expiry, releases, the upgrade horizon and restarts
+- `tests/test_history_api.py` — history endpoint HTTP contract, auth and
+  timestamp validation
 - `tests/test_api.py` — HTTP status codes, structured errors, operator auth
 - `tests/test_concurrency.py` — switch-vs-operation races and address uniqueness

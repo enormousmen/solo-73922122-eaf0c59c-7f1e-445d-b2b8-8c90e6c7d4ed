@@ -21,8 +21,9 @@ class FakeClock:
         self._ticks = itertools.count()
 
     def __call__(self) -> float:
-        # Advance 1ms per call so successive operations are ordered.
-        self.value += 0.001
+        # Advance one whole second per call so successive operations are
+        # ordered and timestamps stay exact (no sub-second float drift).
+        self.value += 1
         return self.value
 
     def advance(self, seconds: float) -> None:

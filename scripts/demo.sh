@@ -66,4 +66,13 @@ say "Invalid pool is rejected; the old pool keeps serving"
 api PUT /v1/pool '{"cidr":"10.30.0.0/40"}' | pretty
 api GET /v1/pool | pretty
 
+say "Forensics: who held tablet-02's address over the last hour (UTC)"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+START=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
+api GET "/v1/admin/addresses/$TABLET_IP/history?start=$START&end=$NOW" | pretty
+
+say "Forensics: a window ending in the future is rejected"
+api GET "/v1/admin/addresses/$TABLET_IP/history?start=2099-01-01T00:00:00Z&end=2099-01-01T01:00:00Z" | pretty
+
 say "Done. Data persists in the 'lease-data' Docker volume across restarts."
